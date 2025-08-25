@@ -14,20 +14,24 @@ import (
 
 // 主配置结构体
 type Config struct {
-	Server  ServerConfig  `mapstructure:"server"`
-	Tushare TushareConfig `mapstructure:"tushare"`
-	Log     LogConfig     `mapstructure:"log"`
+	Server ServerConfig `mapstructure:"server"`
+	Cache  CacheConfig  `mapstructure:"cache"`
+	Log    LogConfig    `mapstructure:"log"`
 }
 
 // 服务器配置
 type ServerConfig struct {
-	Host string `mapstructure:"host"`
-	Port int    `mapstructure:"port"`
+	Host         string `mapstructure:"host"`
+	Port         int    `mapstructure:"port"`
+	ReadTimeout  int    `mapstructure:"read_timeout"`
+	WriteTimeout int    `mapstructure:"write_timeout"`
 }
 
-// Tushare配置
-type TushareConfig struct {
-	Token string `mapstructure:"token"`
+// 缓存配置
+type CacheConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	DBPath  string `mapstructure:"db_path"`
+	TTLDays int    `mapstructure:"ttl_days"`
 }
 
 // 日志配置 - 直接使用 logger 包中的 Config 类型
@@ -39,7 +43,6 @@ var (
 	configMutex       sync.RWMutex
 	watchers          []ConfigWatcher
 	watcherMutex      sync.RWMutex
-	viperInstance     *viper.Viper
 	currentConfigPath string // 记住当前使用的配置文件路径
 )
 
@@ -53,6 +56,13 @@ func setDefaultValues(v *viper.Viper) {
 	// 服务器默认值
 	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.port", 1155)
+	v.SetDefault("server.read_timeout", 30)
+	v.SetDefault("server.write_timeout", 30)
+
+	// 缓存默认值
+	v.SetDefault("cache.enabled", true)
+	v.SetDefault("cache.db_path", "./data/cache")
+	v.SetDefault("cache.ttl_days", 100)
 
 	// 日志默认值 - 直接使用 logger 包的默认配置
 	logCfg := logger.DefaultConfig()
@@ -70,10 +80,21 @@ func validateConfig(config *Config) error {
 	if config.Server.Port < 1 || config.Server.Port > 65535 {
 		return fmt.Errorf("无效的服务器端口: %d (端口范围: 1-65535)", config.Server.Port)
 	}
+	if config.Server.ReadTimeout <= 0 {
+		return fmt.Errorf("读取超时时间必须大于0")
+	}
+	if config.Server.WriteTimeout <= 0 {
+		return fmt.Errorf("写入超时时间必须大于0")
+	}
 
-	// 验证Tushare配置
-	if config.Tushare.Token == "" {
-		return fmt.Errorf("Tushare Token不能为空")
+	// 验证缓存配置
+	if config.Cache.Enabled {
+		if config.Cache.DBPath == "" {
+			return fmt.Errorf("缓存数据库路径不能为空")
+		}
+		if config.Cache.TTLDays <= 0 {
+			return fmt.Errorf("缓存TTL必须大于0天")
+		}
 	}
 
 	// 验证日志配置
@@ -153,23 +174,10 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("配置验证失败: %w", err)
 	}
 
-	// 保存viper实例用于后续使用
-	viperInstance = v
-
 	// 保存当前使用的配置文件路径
 	currentConfigPath = configPath
 
 	return &config, nil
-}
-
-// 简化的配置加载函数（使用默认约定方式）
-func loadConfigDefault() (*Config, error) {
-	return loadConfig("")
-}
-
-// 指定路径的配置加载函数
-func loadConfigFromPath(configPath string) (*Config, error) {
-	return loadConfig(configPath)
 }
 
 // 更新服务器端口配置
@@ -248,58 +256,4 @@ func InitConfigFromPath(configPath string) error {
 	configMutex.Unlock()
 
 	return nil
-}
-
-// 添加配置观察者
-func WatchConfig(watcher ConfigWatcher) {
-	watcherMutex.Lock()
-	defer watcherMutex.Unlock()
-	watchers = append(watchers, watcher)
-}
-
-// 获取当前使用的配置文件路径
-func GetCurrentConfigPath() string {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	return currentConfigPath
-}
-
-// 获取配置值（支持点号分隔的键）
-func GetConfigValue(key string) interface{} {
-	if viperInstance == nil {
-		return nil
-	}
-	return viperInstance.Get(key)
-}
-
-// 获取字符串配置值
-func GetConfigString(key string) string {
-	if viperInstance == nil {
-		return ""
-	}
-	return viperInstance.GetString(key)
-}
-
-// 获取整数配置值
-func GetConfigInt(key string) int {
-	if viperInstance == nil {
-		return 0
-	}
-	return viperInstance.GetInt(key)
-}
-
-// 获取布尔配置值
-func GetConfigBool(key string) bool {
-	if viperInstance == nil {
-		return false
-	}
-	return viperInstance.GetBool(key)
-}
-
-// 获取字符串切片配置值
-func GetConfigStringSlice(key string) []string {
-	if viperInstance == nil {
-		return nil
-	}
-	return viperInstance.GetStringSlice(key)
 }

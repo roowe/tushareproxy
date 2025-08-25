@@ -1,0 +1,20 @@
+[server]
+host = "0.0.0.0"
+port = 1155
+read_timeout = 30
+write_timeout = 30
+
+[cache]
+enabled = true
+db_path = "./data/cache"
+ttl_days = 100
+
+[log]
+# 日志配置
+level = "debug"
+format = "console"
+output = "both"
+file_path = "logs/proxy.log"
+max_size = 10
+max_age = 30
+max_backups = 10

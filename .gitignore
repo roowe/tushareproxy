@@ -34,3 +34,5 @@ go.work.sum
 proxy.toml
 
 logs/
+data/cache
+tushareproxy
