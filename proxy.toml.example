@@ -7,7 +7,9 @@ write_timeout = 30
 [cache]
 enabled = true
 db_path = "./data/cache"
-ttl_days = 100
+default_ttl_seconds = 8640000
+default_namespace = "default"
+gc_interval_seconds = 300
 
 [log]
 # 日志配置

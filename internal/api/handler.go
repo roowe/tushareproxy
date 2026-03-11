@@ -16,12 +16,24 @@ import (
 
 // TushareAPIResult 用于检查API响应状态的简化结构体
 type TushareAPIResult struct {
-	Code int    `json:"code"`
-	Msg  string `json:"msg"`
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data *TushareAPIData `json:"data,omitempty"`
+}
+
+type TushareAPIData struct {
+	Items []json.RawMessage `json:"items"`
 }
 
 const (
 	TushareAPIURL = "http://api.waditu.com/dataapi"
+)
+
+const (
+	cacheStatusHit      = "HIT"
+	cacheStatusMiss     = "MISS"
+	cacheStatusBypass   = "BYPASS"
+	cacheStatusDisabled = "DISABLED"
 )
 
 // 全局缓存管理器
@@ -55,33 +67,58 @@ func DataAPIHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	preparedRequest, err := parseIncomingRequest(body)
+	if err != nil {
+		logger.Warn("解析请求体失败", zap.Error(err))
+		sendErrorResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// 生成缓存键
 	var cacheKey string
+	var namespace string
 	var response []byte
 	var statusCode int
 	var isFromCache bool
+	var cacheStatus = cacheStatusDisabled
 
 	if cacheManager != nil {
-		cacheKey = cacheManager.GenerateKey(body)
+		if err := preparedRequest.Policy.Validate(cacheManager.DefaultNamespace(), startTime); err != nil {
+			logger.Warn("缓存策略校验失败", zap.Error(err))
+			sendErrorResponse(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-		// 尝试从缓存获取
-		if entry, found := cacheManager.Get(cacheKey); found {
+		namespace = preparedRequest.Policy.ResolvedNamespace(cacheManager.DefaultNamespace())
+		cacheKey = cacheManager.GenerateKey(namespace, preparedRequest.ForwardBody)
+		cacheStatus = cacheStatusMiss
+
+		if preparedRequest.Policy.NoCache {
+			cacheStatus = cacheStatusBypass
+		} else if entry, found := cacheManager.Get(cacheKey); found {
 			response = entry.ResponseBody
 			statusCode = entry.StatusCode
 			isFromCache = true
+			cacheStatus = cacheStatusHit
 			logger.Info("使用缓存响应",
+				zap.String("api_name", preparedRequest.APIName),
 				zap.String("cache_key", cacheKey),
+				zap.String("namespace", namespace),
 				zap.Int("status_code", statusCode))
 		}
 	}
 
 	// 如果缓存未命中，转发请求
 	if !isFromCache {
-		logger.Info("转发tushare API请求", zap.String("body", string(body)))
+		logger.Info("转发tushare API请求",
+			zap.String("api_name", preparedRequest.APIName),
+			zap.String("namespace", namespace),
+			zap.String("cache_status", cacheStatus),
+			zap.Bool("no_cache", preparedRequest.Policy.NoCache))
 
 		// 直接转发请求到tushare API
 		var err error
-		response, statusCode, err = forwardRawRequestToTushareAPI(body)
+		response, statusCode, err = forwardRawRequestToTushareAPI(preparedRequest.ForwardBody)
 		if err != nil {
 			logger.Error("转发请求到tushare API失败", zap.Error(err))
 			sendErrorResponse(w, "请求tushare API失败", http.StatusInternalServerError)
@@ -96,8 +133,17 @@ func DataAPIHandler(w http.ResponseWriter, r *http.Request) {
 			var result TushareAPIResult
 			if err := json.Unmarshal(response, &result); err == nil {
 				if result.Code == 0 {
-					shouldCache = true
-					logger.Debug("tushare API响应成功，可以缓存", zap.Int("code", result.Code))
+					itemCount := result.itemCount()
+					if itemCount > 0 {
+						shouldCache = true
+						logger.Debug("tushare API响应成功，可以缓存",
+							zap.Int("code", result.Code),
+							zap.Int("item_count", itemCount))
+					} else {
+						logger.Info("tushare API响应成功但无数据，不缓存",
+							zap.Int("code", result.Code),
+							zap.Int("item_count", itemCount))
+					}
 				} else {
 					logger.Warn("tushare API返回错误码，不缓存",
 						zap.Int("code", result.Code),
@@ -109,12 +155,29 @@ func DataAPIHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 只有在响应成功且code=0时才缓存
-		if cacheManager != nil && shouldCache {
-			if err := cacheManager.Set(cacheKey, body, response, statusCode); err != nil {
+		if cacheManager != nil && shouldCache && !preparedRequest.Policy.NoCache {
+			cacheExpiresAt, err := resolveCacheExpiration(
+				preparedRequest.Policy,
+				cacheManager.DefaultTTL(),
+				time.Now(),
+			)
+			if err != nil {
+				logger.Error("解析缓存过期时间失败", zap.Error(err))
+			} else if err := cacheManager.Set(
+				cacheKey,
+				namespace,
+				preparedRequest.ForwardBody,
+				response,
+				statusCode,
+				cacheExpiresAt,
+			); err != nil {
 				logger.Error("设置缓存失败", zap.Error(err))
 				// 缓存失败不影响响应
 			} else {
-				logger.Debug("响应已缓存", zap.String("cache_key", cacheKey))
+				logger.Debug("响应已缓存",
+					zap.String("cache_key", cacheKey),
+					zap.String("namespace", namespace),
+					zap.Int64("expires_at", cacheExpiresAt.Unix()))
 			}
 		}
 	}
@@ -128,7 +191,10 @@ func DataAPIHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Info("请求处理完成",
 		zap.Duration("duration", time.Since(startTime)),
 		zap.Bool("from_cache", isFromCache),
-		zap.String("cache_key", cacheKey))
+		zap.String("cache_status", cacheStatus),
+		zap.String("namespace", namespace),
+		zap.String("cache_key", cacheKey),
+		zap.String("api_name", preparedRequest.APIName))
 }
 
 // forwardRawRequestToTushareAPI 直接转发原始请求到tushare API
@@ -181,4 +247,11 @@ func sendErrorResponse(w http.ResponseWriter, message string, statusCode int) {
 
 	response, _ := json.Marshal(errorResp)
 	w.Write(response)
+}
+
+func (r TushareAPIResult) itemCount() int {
+	if r.Data == nil {
+		return 0
+	}
+	return len(r.Data.Items)
 }

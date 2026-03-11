@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"time"
 
 	"github.com/roowe/tushareproxy/internal/api"
@@ -45,7 +47,12 @@ func main() {
 	// 初始化缓存
 	var cacheManager *cache.CacheManager
 	if cfg.Cache.Enabled {
-		cacheManager, err = cache.NewCacheManager(cfg.Cache.DBPath, cfg.Cache.TTLDays)
+		cacheManager, err = cache.NewCacheManager(
+			cfg.Cache.DBPath,
+			cfg.Cache.DefaultTTLSeconds,
+			cfg.Cache.DefaultNamespace,
+			time.Duration(cfg.Cache.GCIntervalSeconds)*time.Second,
+		)
 		if err != nil {
 			logger.Fatal("初始化缓存失败", zap.Error(err))
 		}
@@ -66,7 +73,7 @@ func main() {
 
 	// 启动HTTP服务器
 	logger.Info("正在启动HTTP服务器...")
-	if err := httpServer.Start(); err != nil {
+	if err := httpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal("HTTP服务器启动失败", zap.Error(err))
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -14,8 +15,10 @@ import (
 
 // CacheManager 缓存管理器
 type CacheManager struct {
-	db  *badger.DB
-	ttl time.Duration
+	db               *badger.DB
+	defaultTTL       time.Duration
+	defaultNamespace string
+	gcInterval       time.Duration
 }
 
 // CacheEntry 缓存条目
@@ -24,10 +27,17 @@ type CacheEntry struct {
 	ResponseBody []byte `json:"response_body"`
 	StatusCode   int    `json:"status_code"`
 	Timestamp    int64  `json:"timestamp"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"`
+	Namespace    string `json:"namespace,omitempty"`
 }
 
 // NewCacheManager 创建新的缓存管理器
-func NewCacheManager(dbPath string, ttlDays int) (*CacheManager, error) {
+func NewCacheManager(
+	dbPath string,
+	defaultTTLSeconds int,
+	defaultNamespace string,
+	gcInterval time.Duration,
+) (*CacheManager, error) {
 	// 配置BadgerDB选项
 	opts := badger.DefaultOptions(dbPath)
 	opts.Logger = nil // 禁用BadgerDB的默认日志输出
@@ -38,15 +48,25 @@ func NewCacheManager(dbPath string, ttlDays int) (*CacheManager, error) {
 		return nil, fmt.Errorf("打开BadgerDB失败: %w", err)
 	}
 
-	ttl := time.Duration(ttlDays) * 24 * time.Hour
+	defaultTTL := time.Duration(defaultTTLSeconds) * time.Second
+	if defaultNamespace == "" {
+		defaultNamespace = "default"
+	}
+	if gcInterval <= 0 {
+		gcInterval = 5 * time.Minute
+	}
 
 	logger.Info("缓存管理器初始化成功",
 		zap.String("db_path", dbPath),
-		zap.Int("ttl_days", ttlDays))
+		zap.Int("default_ttl_seconds", defaultTTLSeconds),
+		zap.String("default_namespace", defaultNamespace),
+		zap.Duration("gc_interval", gcInterval))
 
 	return &CacheManager{
-		db:  db,
-		ttl: ttl,
+		db:               db,
+		defaultTTL:       defaultTTL,
+		defaultNamespace: defaultNamespace,
+		gcInterval:       gcInterval,
 	}, nil
 }
 
@@ -59,10 +79,30 @@ func (cm *CacheManager) Close() error {
 	return nil
 }
 
-// GenerateKey 根据请求体生成缓存键
-func (cm *CacheManager) GenerateKey(requestBody []byte) string {
+// DefaultTTL 返回默认TTL
+func (cm *CacheManager) DefaultTTL() time.Duration {
+	return cm.defaultTTL
+}
+
+// DefaultNamespace 返回默认命名空间
+func (cm *CacheManager) DefaultNamespace() string {
+	return cm.defaultNamespace
+}
+
+// ResolveNamespace 解析命名空间
+func (cm *CacheManager) ResolveNamespace(namespace string) string {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return cm.defaultNamespace
+	}
+	return namespace
+}
+
+// GenerateKey 根据请求体和命名空间生成缓存键
+func (cm *CacheManager) GenerateKey(namespace string, requestBody []byte) string {
+	resolvedNamespace := cm.ResolveNamespace(namespace)
 	hash := sha256.Sum256(requestBody)
-	return hex.EncodeToString(hash[:])
+	return fmt.Sprintf("%s:%s", resolvedNamespace, hex.EncodeToString(hash[:]))
 }
 
 // Get 从缓存中获取数据
@@ -89,8 +129,8 @@ func (cm *CacheManager) Get(key string) (*CacheEntry, bool) {
 		return nil, false
 	}
 
-	// 检查是否过期（额外的过期检查，虽然BadgerDB会自动处理TTL）
-	if time.Since(time.Unix(entry.Timestamp, 0)) > cm.ttl {
+	expiresAt := entry.resolveExpiresAt(cm.defaultTTL)
+	if expiresAt.IsZero() || !time.Now().Before(expiresAt) {
 		logger.Debug("缓存已过期", zap.String("key", key))
 		cm.Delete(key) // 异步删除过期的条目
 		return nil, false
@@ -101,12 +141,26 @@ func (cm *CacheManager) Get(key string) (*CacheEntry, bool) {
 }
 
 // Set 设置缓存数据
-func (cm *CacheManager) Set(key string, requestBody, responseBody []byte, statusCode int) error {
+func (cm *CacheManager) Set(
+	key string,
+	namespace string,
+	requestBody,
+	responseBody []byte,
+	statusCode int,
+	expiresAt time.Time,
+) error {
+	ttl := time.Until(expiresAt)
+	if ttl <= 0 {
+		return fmt.Errorf("缓存过期时间必须晚于当前时间")
+	}
+
 	entry := &CacheEntry{
 		RequestBody:  requestBody,
 		ResponseBody: responseBody,
 		StatusCode:   statusCode,
 		Timestamp:    time.Now().Unix(),
+		ExpiresAt:    expiresAt.Unix(),
+		Namespace:    cm.ResolveNamespace(namespace),
 	}
 
 	data, err := json.Marshal(entry)
@@ -115,7 +169,7 @@ func (cm *CacheManager) Set(key string, requestBody, responseBody []byte, status
 	}
 
 	err = cm.db.Update(func(txn *badger.Txn) error {
-		e := badger.NewEntry([]byte(key), data).WithTTL(cm.ttl)
+		e := badger.NewEntry([]byte(key), data).WithTTL(ttl)
 		return txn.SetEntry(e)
 	})
 
@@ -126,6 +180,8 @@ func (cm *CacheManager) Set(key string, requestBody, responseBody []byte, status
 
 	logger.Debug("缓存设置成功",
 		zap.String("key", key),
+		zap.String("namespace", entry.Namespace),
+		zap.Int64("expires_at", entry.ExpiresAt),
 		zap.Int("status_code", statusCode),
 		zap.Int("response_size", len(responseBody)))
 
@@ -179,7 +235,7 @@ func (cm *CacheManager) RunGC() error {
 // StartGCRoutine 启动后台垃圾回收例程
 func (cm *CacheManager) StartGCRoutine() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(cm.gcInterval)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -188,4 +244,14 @@ func (cm *CacheManager) StartGCRoutine() {
 	}()
 
 	logger.Info("缓存垃圾回收例程已启动")
+}
+
+func (e *CacheEntry) resolveExpiresAt(defaultTTL time.Duration) time.Time {
+	if e.ExpiresAt > 0 {
+		return time.Unix(e.ExpiresAt, 0)
+	}
+	if e.Timestamp > 0 {
+		return time.Unix(e.Timestamp, 0).Add(defaultTTL)
+	}
+	return time.Time{}
 }

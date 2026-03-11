@@ -29,9 +29,11 @@ type ServerConfig struct {
 
 // 缓存配置
 type CacheConfig struct {
-	Enabled bool   `mapstructure:"enabled"`
-	DBPath  string `mapstructure:"db_path"`
-	TTLDays int    `mapstructure:"ttl_days"`
+	Enabled           bool   `mapstructure:"enabled"`
+	DBPath            string `mapstructure:"db_path"`
+	DefaultTTLSeconds int    `mapstructure:"default_ttl_seconds"`
+	DefaultNamespace  string `mapstructure:"default_namespace"`
+	GCIntervalSeconds int    `mapstructure:"gc_interval_seconds"`
 }
 
 // 日志配置 - 直接使用 logger 包中的 Config 类型
@@ -62,7 +64,9 @@ func setDefaultValues(v *viper.Viper) {
 	// 缓存默认值
 	v.SetDefault("cache.enabled", true)
 	v.SetDefault("cache.db_path", "./data/cache")
-	v.SetDefault("cache.ttl_days", 100)
+	v.SetDefault("cache.default_ttl_seconds", 100*24*60*60)
+	v.SetDefault("cache.default_namespace", "default")
+	v.SetDefault("cache.gc_interval_seconds", 300)
 
 	// 日志默认值 - 直接使用 logger 包的默认配置
 	logCfg := logger.DefaultConfig()
@@ -92,8 +96,14 @@ func validateConfig(config *Config) error {
 		if config.Cache.DBPath == "" {
 			return fmt.Errorf("缓存数据库路径不能为空")
 		}
-		if config.Cache.TTLDays <= 0 {
-			return fmt.Errorf("缓存TTL必须大于0天")
+		if config.Cache.DefaultTTLSeconds <= 0 {
+			return fmt.Errorf("缓存默认 TTL 必须大于 0 秒")
+		}
+		if config.Cache.DefaultNamespace == "" {
+			return fmt.Errorf("缓存默认 namespace 不能为空")
+		}
+		if config.Cache.GCIntervalSeconds <= 0 {
+			return fmt.Errorf("缓存 GC 间隔必须大于 0 秒")
 		}
 	}
 
@@ -126,6 +136,7 @@ func loadConfig(configPath string) (*Config, error) {
 	logger.Debug("configPath", zap.String("path", configPath))
 	if configPath != "" {
 		// 如果指定了配置文件路径，直接使用
+		v.SetConfigType("toml")
 		v.SetConfigFile(configPath)
 
 		// 检查文件是否存在
