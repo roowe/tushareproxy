@@ -36,3 +36,6 @@ proxy.toml
 logs/
 data/cache
 tushareproxy
+
+# 发布产物
+release/
